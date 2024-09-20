@@ -1,7 +1,8 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
-import random
+import tempfile
 import time
 
+import wandb
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 import gymnasium as gym
 import numpy as np
@@ -24,6 +25,68 @@ def make_env(env_id):
         return env
 
     return thunk
+
+
+class ObsNormalizer(nn.Module):
+    def __init__(self, obs_size: int) -> None:
+        super().__init__()
+        self._count = nn.Parameter(
+            torch.tensor(0, dtype=torch.int64),
+            requires_grad=False,
+        )
+        self._mean = nn.Parameter(
+            torch.zeros(
+                size=(obs_size,),
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        self._var = nn.Parameter(
+            torch.ones(
+                size=(obs_size,),
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+
+    @property
+    def mean(self) -> np.ndarray:
+        return self._mean.detach().cpu().numpy()
+
+    @property
+    def var(self) -> np.ndarray:
+        return self._var.detach().cpu().numpy()
+
+    def normalize(self, obs: torch.Tensor) -> torch.Tensor:
+        return (obs - self._mean) / (self._var + 1e-3).sqrt()
+
+    def forward(self, obs: torch.Tensor) -> None:
+        self.update(obs)
+
+    def update(self, obs: torch.Tensor) -> None:
+        if len(obs.shape) == 1:
+            obs = obs.unsqueeze(0)
+
+        batch_count = obs.shape[0]
+        new_count = self._count + batch_count
+
+        # compute new mean
+        batch_mean = obs.mean(dim=0)
+        delta = batch_mean - self._mean
+        new_mean = self._mean + delta * batch_count / new_count
+
+        # compute new variance
+        batch_var = obs.var(dim=0, unbiased=False)
+        new_var = (
+            self._var * (self._count / new_count)
+            + batch_var * (batch_count / new_count)
+            + delta.pow(2) * (self._count / new_count) * (batch_count / new_count)
+        )
+
+        # update parameters
+        self._mean.copy_(new_mean)
+        self._var.copy_(new_var)
+        self._count.copy_(new_count)
 
 
 # ALGO LOGIC: initialize agent here:
@@ -116,6 +179,12 @@ if __name__ == "__main__":
     rb = FlatReplayBuffer(wm.cfg.buffer_size)
     global_start_time = time.time()
 
+    # obs normalizer
+    if wm.cfg.obs_norm:
+        obs_normalizer = ObsNormalizer(obs_size=int(train_envs.single_observation_space.shape))
+    else:
+        obs_normalizer = None
+
     """START TRAINING"""
     obs, _ = train_envs.reset()
     has_reset = False
@@ -123,11 +192,20 @@ if __name__ == "__main__":
     for global_step in tqdm(range(wm.cfg.total_timesteps)):
         loop_timer = time.time()
 
+        # update obs normalizer
+        if obs_normalizer is not None:
+            obs_normalizer.update(obs)
+
         # sample an action
         if global_step < wm.cfg.learning_starts:
             act = np.array([train_envs.single_action_space.sample() for _ in range(train_envs.num_envs)])
         else:
-            act, _, _ = actor.get_action(torch.Tensor(obs).to(wm.device))
+            # to tensor and conditionally normalize
+            t_obs = torch.Tensor(obs).to(wm.device)
+            if obs_normalizer is not None:
+                t_obs = obs_normalizer.normalize(t_obs)
+
+            act, _, _ = actor.get_action(t_obs)
             act = act.detach().cpu().numpy()
 
         # take an environment step
@@ -151,7 +229,12 @@ if __name__ == "__main__":
             eval_done = False
             evaluation_score = 0.0
             while not eval_done:
-                eval_act, _, _ = actor.get_action(torch.Tensor(eval_obs).to(wm.device))
+                # to tensor and conditionally normalize
+                t_obs = torch.Tensor(obs).to(wm.device)
+                if obs_normalizer is not None:
+                    t_obs = obs_normalizer.normalize(t_obs)
+
+                eval_act, _, _ = actor.get_action(t_obs)
                 eval_act = eval_act.detach().cpu().numpy()
 
                 # take an environment step
@@ -177,6 +260,10 @@ if __name__ == "__main__":
             s_rew = torch.tensor(s_rew, device=wm.device)
             s_term = torch.tensor(s_term, device=wm.device)
             s_next_obs = torch.tensor(s_next_obs, device=wm.device)
+
+            # normalize_obs
+            if obs_normalizer is not None:
+                s_obs = obs_normalizer.normalize(s_obs)
 
             # compute target value
             with torch.no_grad():
@@ -238,3 +325,36 @@ if __name__ == "__main__":
         wm.checkpoint(loss=-evaluation_score, step=global_step)
 
     train_envs.close()
+
+    if obs_normalizer is None:
+        exit()
+
+    if not wm.cfg.wandb.enable:
+        exit()
+
+    with tempfile.NamedTemporaryFile(suffix=".png") as mean_f, tempfile.NamedTemporaryFile(suffix=".png") as var_f:
+        # plot and save mean
+        plt.bar(
+            range(obs_normalizer.mean.shape[0]),
+            obs_normalizer.mean,
+        )
+        plt.title(f"Mean - {wm.cfg.env_id}")
+        plt.savefig(mean_f.name)
+        plt.close()
+
+        # plot and save var
+        plt.bar(
+            range(obs_normalizer.var.shape[0]),
+            obs_normalizer.var,
+        )
+        plt.title(f"Var - {wm.cfg.env_id}")
+        plt.savefig(var_f.name)
+        plt.close()
+
+        # log to wandb
+        wandb.log(
+            {
+                "obs_mean": wandb.Image(mean_f.name),
+                "obs_var": wandb.Image(var_f.name),
+            }
+        )

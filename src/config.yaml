@@ -3,7 +3,7 @@ env_id: "dm_control/cheetah-run-v0"
 
 # Algorithm specific arguments
 # total timesteps of the experiments
-total_timesteps: 1000000
+total_timesteps: 200000
 # the replay memory buffer size
 buffer_size: 1000000
 # the discount factor gamma
