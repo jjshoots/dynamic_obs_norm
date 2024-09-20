@@ -7,14 +7,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import shimmy
 import torch
-import torch.nn.functional as F
-import torch.optim as optim
 import wandb
 from memorial.replay_buffers import FlatReplayBuffer
 from tqdm import tqdm
 from wingman import Wingman
 
-from blocks import Actor, ObsNormalizer, QNetwork
 from sac import SAC
 
 gym.register_envs(shimmy)
@@ -58,17 +55,17 @@ if __name__ == "__main__":
     global_start_time = time.time()
 
     """START TRAINING"""
-    obs, _ = train_envs.reset()
+    c_obs, _ = train_envs.reset()
     has_reset = False
     evaluation_score = 0.0
     for global_step in tqdm(range(wm.cfg.total_timesteps)):
         # update obs normalizer
         if alg.obs_normalizer is not None:
-            alg.obs_normalizer.update(torch.tensor(obs, device=wm.device))
+            alg.obs_normalizer.update(torch.tensor(c_obs, device=wm.device))
 
         # sample an action
         if global_step < wm.cfg.learning_starts:
-            act = np.array(
+            c_act = np.array(
                 [
                     train_envs.single_action_space.sample()
                     for _ in range(train_envs.num_envs)
@@ -76,47 +73,48 @@ if __name__ == "__main__":
             )
         else:
             # to tensor and conditionally normalize
-            t_obs = torch.tensor(obs, device=wm.device, dtype=torch.float32)
+            t_obs = torch.tensor(c_obs, device=wm.device, dtype=torch.float32)
             if alg.obs_normalizer is not None:
                 t_obs = alg.obs_normalizer.normalize(t_obs)
 
-            act, _ = alg.actor.get_action(t_obs)
-            act = act.detach().cpu().numpy()
+            c_act, _ = alg.actor.get_action(t_obs)
+            c_act = c_act.detach().cpu().numpy()
 
         # take an environment step
-        next_obs, rew, term, trunc, _ = train_envs.step(act)
+        c_next_obs, c_rew, c_term, c_trunc, _ = train_envs.step(c_act)
 
         # add to buffer if we're not in a fresh state
         if not has_reset:
-            rb.push([obs, act, rew, term, next_obs], bulk=True)
+            rb.push(
+                [c_obs, c_act, c_rew, c_term, c_next_obs],
+                bulk=True,
+            )
 
         # rollover things
-        obs = next_obs
-        has_reset = term[0] or trunc[0]
+        c_obs = c_next_obs
+        has_reset = c_term[0] or c_trunc[0]
 
         # perform evaluation if needed
         if global_step % wm.cfg.evaluation_freq == 0:
-            eval_obs, _ = eval_envs.reset()
-            eval_done = False
+            e_obs, _ = eval_envs.reset()
+            e_done = False
             evaluation_score = 0.0
-            while not eval_done:
+            while not e_done:
                 # to tensor and conditionally normalize
-                t_obs = torch.tensor(obs, device=wm.device, dtype=torch.float32)
+                t_obs = torch.tensor(e_obs, device=wm.device, dtype=torch.float32)
                 if alg.obs_normalizer is not None:
                     t_obs = alg.obs_normalizer.normalize(t_obs)
 
-                eval_act, _ = alg.actor.get_action(t_obs)
-                eval_act = eval_act.detach().cpu().numpy()
+                e_act, _ = alg.actor.get_action(t_obs)
+                e_act = e_act.detach().cpu().numpy()
 
                 # take an environment step
-                eval_next_obs, eval_rew, eval_term, eval_trunc, _ = eval_envs.step(
-                    eval_act
-                )
-                evaluation_score += float(eval_rew[0])
+                e_next_obs, e_rew, e_term, e_trunc, _ = eval_envs.step(e_act)
+                evaluation_score += float(e_rew[0])
 
                 # rollover things
-                eval_obs = eval_next_obs
-                eval_done = eval_term[0] or eval_trunc[0]
+                e_obs = e_next_obs
+                e_done = e_term[0] or e_trunc[0]
 
             # log some things
             wm.log["evaluation/cumulative_reward"] = evaluation_score
@@ -125,7 +123,10 @@ if __name__ == "__main__":
         if global_step > wm.cfg.learning_starts:
             # sample and update and record infos
             update_infos = alg.update(
-                *[torch.tensor(x, device=wm.device) for x in rb.sample(wm.cfg.batch_size)]
+                *[
+                    torch.tensor(x, device=wm.device)
+                    for x in rb.sample(wm.cfg.batch_size)
+                ]
             )
             for k, v in update_infos.items():
                 wm.log[f"algorithm/{k}"] = v

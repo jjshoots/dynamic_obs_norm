@@ -1,11 +1,12 @@
 from typing import Sequence, cast
-import numpy as np
+
 import torch
-from torch.cuda import CUDAGraph
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda import CUDAGraph
 
 from blocks import Actor, ObsNormalizer, QNetwork
+
 
 class SAC(nn.Module):
     def __init__(
@@ -63,9 +64,7 @@ class SAC(nn.Module):
 
         # obs normalizer
         if use_obs_norm:
-            self.obs_normalizer = ObsNormalizer(
-                obs_size=obs_size
-            ).to(device)
+            self.obs_normalizer = ObsNormalizer(obs_size=obs_size).to(device)
         else:
             self.obs_normalizer = None
 
@@ -81,7 +80,7 @@ class SAC(nn.Module):
         act: torch.Tensor,
         rew: torch.Tensor,
         term: torch.Tensor,
-        next_obs: torch.Tensor
+        next_obs: torch.Tensor,
     ) -> dict[str, float]:
         # stack everything so it's easier to handle
         batch = (obs, act, rew, term, next_obs)
@@ -119,7 +118,7 @@ class SAC(nn.Module):
         act: torch.Tensor,
         rew: torch.Tensor,
         term: torch.Tensor,
-        next_obs: torch.Tensor
+        next_obs: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         # normalize_obs
         if self.obs_normalizer is not None:
@@ -135,9 +134,9 @@ class SAC(nn.Module):
                 torch.min(qf1_next_target, qf2_next_target)
                 - self.log_alpha.exp() * next_log_pi
             )
-            next_q_value = rew.flatten() + (
-                1 - term.flatten()
-            ) * self.gamma * (min_qf_next_target).view(-1)
+            next_q_value = rew.flatten() + (1 - term.flatten()) * self.gamma * (
+                min_qf_next_target
+            ).view(-1)
 
         # compute critic loss
         qf1_a_values = self.qf1(obs, act).view(-1)
@@ -174,11 +173,15 @@ class SAC(nn.Module):
         self.alpha_optim.step()
 
         # update the target networks
-        for param, target_param in zip(self.qf1.parameters(), self.qf1_target.parameters()):
+        for param, target_param in zip(
+            self.qf1.parameters(), self.qf1_target.parameters()
+        ):
             target_param.data.copy_(
                 self.tau * param.data + (1 - self.tau) * target_param.data
             )
-        for param, target_param in zip(self.qf2.parameters(), self.qf2_target.parameters()):
+        for param, target_param in zip(
+            self.qf2.parameters(), self.qf2_target.parameters()
+        ):
             target_param.data.copy_(
                 self.tau * param.data + (1 - self.tau) * target_param.data
             )
