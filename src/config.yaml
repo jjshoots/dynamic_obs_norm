@@ -1,4 +1,4 @@
-run_generation: 1
+run_generation: 0
 # environment id of the task
 env_id: "dm_control/cheetah-run-v0"
 
@@ -48,4 +48,4 @@ wandb:
     notes: ""
   project:
     name: "obs_norm"
-    entity: "wingman"
+    entity: "jjshoots"
