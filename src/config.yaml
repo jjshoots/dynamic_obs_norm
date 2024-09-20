@@ -44,8 +44,8 @@ wandb:
   enable: false
   save_code: false
   run:
-    name: ""
+    name: "dmc"
     notes: ""
   project:
-    name: "my_new_project"
+    name: "obs_norm"
     entity: "wingman"
