@@ -2,6 +2,7 @@
 import random
 import time
 
+from tqdm import tqdm
 import gymnasium as gym
 import numpy as np
 import torch
@@ -11,13 +12,15 @@ import torch.optim as optim
 from memorial.replay_buffers import FlatReplayBuffer
 from wingman import Wingman
 from pathlib import Path
+import shimmy
+gym.register_envs(shimmy)
 
 
-def make_env(env_id, seed):
+def make_env(env_id):
     def thunk():
         env = gym.make(env_id)
+        env = gym.wrappers.FlattenObservation(env)
         env = gym.wrappers.RescaleAction(env, min_action=-1.0, max_action=1.0)
-        env.action_space.seed(seed)
         return env
 
     return thunk
@@ -86,30 +89,23 @@ class Actor(nn.Module):
 if __name__ == "__main__":
     wm = Wingman(Path(__file__).parent / "config.yaml")
 
-    # seeding
-    random.seed(wm.cfg.seed)
-    np.random.seed(wm.cfg.seed)
-    torch.manual_seed(wm.cfg.seed)
-    torch.backends.cudnn.deterministic = wm.cfg.torch_deterministic
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     """SETUPS"""
     # env setup
-    envs = gym.vector.SyncVectorEnv([make_env(wm.cfg.env_id, wm.cfg.seed)])
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+    train_envs = gym.vector.SyncVectorEnv([make_env(wm.cfg.env_id)])
+    eval_envs = gym.vector.SyncVectorEnv([make_env(wm.cfg.env_id)])
+    assert isinstance(train_envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     # alg setup
-    actor = Actor(envs).to(device)
-    qf1 = SoftQNetwork(envs).to(device)
-    qf2 = SoftQNetwork(envs).to(device)
-    qf1_target = SoftQNetwork(envs).to(device)
-    qf2_target = SoftQNetwork(envs).to(device)
+    actor = Actor(train_envs).to(wm.device)
+    qf1 = SoftQNetwork(train_envs).to(wm.device)
+    qf2 = SoftQNetwork(train_envs).to(wm.device)
+    qf1_target = SoftQNetwork(train_envs).to(wm.device)
+    qf2_target = SoftQNetwork(train_envs).to(wm.device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
 
-    target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
-    log_alpha = torch.zeros(1, requires_grad=True, device=device)
+    target_entropy = -torch.prod(torch.Tensor(train_envs.single_action_space.shape).to(wm.device)).item()
+    log_alpha = torch.zeros(1, requires_grad=True, device=wm.device)
     alpha = log_alpha.exp().item()
 
     critic_optim = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=wm.cfg.q_lr)
@@ -118,39 +114,69 @@ if __name__ == "__main__":
 
     # replay buffer setup
     rb = FlatReplayBuffer(wm.cfg.buffer_size)
-    start_time = time.time()
+    global_start_time = time.time()
 
     """START TRAINING"""
-    obs, _ = envs.reset(seed=wm.cfg.seed)
+    obs, _ = train_envs.reset()
     has_reset = False
-    for global_step in range(wm.cfg.total_timesteps):
+    evaluation_score = 0.0
+    for global_step in tqdm(range(wm.cfg.total_timesteps)):
+        loop_timer = time.time()
+
         # sample an action
         if global_step < wm.cfg.learning_starts:
-            act = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            act = np.array([train_envs.single_action_space.sample() for _ in range(train_envs.num_envs)])
         else:
-            act, _, _ = actor.get_action(torch.Tensor(obs).to(device))
+            act, _, _ = actor.get_action(torch.Tensor(obs).to(wm.device))
             act = act.detach().cpu().numpy()
 
         # take an environment step
-        next_obs, rew, term, truncations, infos = envs.step(act)
+        next_obs, rew, term, trunc, _ = train_envs.step(act)
 
         # add to buffer if we're not in a fresh state
         if not has_reset:
-            rb.push([obs, act, rew, term, next_obs])
+            rb.push([obs, act, rew, term, next_obs], bulk=True)
 
         # rollover things
         obs = next_obs
-        has_reset = term[0] or truncations[0]
+        has_reset = term[0] or trunc[0]
 
-        # take a gradient step
+        # log some things
+        wm.log["timers/loop_time"] = time.time() - loop_timer
+
+        # perform evaluation if needed
+        if global_step % wm.cfg.evaluation_freq == 0:
+            loop_timer = time.time()
+            eval_obs, _ = eval_envs.reset()
+            eval_done = False
+            evaluation_score = 0.0
+            while not eval_done:
+                eval_act, _, _ = actor.get_action(torch.Tensor(eval_obs).to(wm.device))
+                eval_act = eval_act.detach().cpu().numpy()
+
+                # take an environment step
+                eval_next_obs, eval_rew, eval_term, eval_trunc, _ = eval_envs.step(eval_act)
+                evaluation_score += float(eval_rew[0])
+
+                # rollover things
+                eval_obs = eval_next_obs
+                eval_done = eval_term[0] or eval_trunc[0]
+
+            # log some things
+            wm.log["timers/eval_time"] = time.time() - loop_timer
+            wm.log["evaluation/cumulative_reward"] = evaluation_score
+
+        # take a gradient step if allowed
         if global_step > wm.cfg.learning_starts:
+            loop_timer = time.time()
+
             # sample and send to device
             s_obs, s_act, s_rew, s_term, s_next_obs = rb.sample(wm.cfg.batch_size)
-            s_obs = torch.tensor(s_obs, device=device)
-            s_act = torch.tensor(s_act, device=device)
-            s_rew = torch.tensor(s_rew, device=device)
-            s_term = torch.tensor(s_term, device=device)
-            s_next_obs = torch.tensor(s_next_obs, device=device)
+            s_obs = torch.tensor(s_obs, device=wm.device)
+            s_act = torch.tensor(s_act, device=wm.device)
+            s_rew = torch.tensor(s_rew, device=wm.device)
+            s_term = torch.tensor(s_term, device=wm.device)
+            s_next_obs = torch.tensor(s_next_obs, device=wm.device)
 
             # compute target value
             with torch.no_grad():
@@ -201,4 +227,14 @@ if __name__ == "__main__":
             for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
                 target_param.data.copy_(wm.cfg.tau * param.data + (1 - wm.cfg.tau) * target_param.data)
 
-    envs.close()
+            # log some things
+            wm.log["timers/update_time"] = time.time() - loop_timer
+            wm.log["algorithm/critic_loss"] = float(qf_loss.mean().detach().cpu())
+            wm.log["algorithm/actor_loss"] = float(actor_loss.mean().detach().cpu())
+            wm.log["algorithm/alpha_loss"] = float(alpha_loss.mean().detach().cpu())
+            wm.log["algorithm/target_q"] = float(next_q_value.mean().detach().cpu())
+            wm.log["algorithm/log_pi"] = float(log_pi.mean().detach().cpu())
+
+        wm.checkpoint(loss=-evaluation_score, step=global_step)
+
+    train_envs.close()
