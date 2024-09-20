@@ -3,7 +3,7 @@ env_id: "dm_control/cheetah-run-v0"
 
 # Algorithm specific arguments
 # total timesteps of the experiments
-total_timesteps: 200000
+total_timesteps: 1000000
 # the replay memory buffer size
 buffer_size: 1000000
 # the discount factor gamma
@@ -17,9 +17,9 @@ learning_starts: 50000
 # how often to evaluate the policy
 evaluation_freq: 10000
 # the learning rate of the policy network optimizer
-policy_lr: 0.0003
+actor_lr: 0.0003
 # the learning rate of the Q network network optimizer
-q_lr: 0.001
+critic_lr: 0.001
 # whether to use torch.compile
 compile: true
 # whether to use the magic component
